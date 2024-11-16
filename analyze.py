@@ -52,12 +52,22 @@ def uniquest_prefix_in_prowjobs(prowjob_df: pandas.DataFrame, attr: str) -> Dict
 
 if __name__ == '__main__':
 
-    start_date = "2024-11-01"
+    jobs_table_id = 'openshift-gce-devel.ci_analysis_us.jobs'
+    intervals_table_id = 'openshift-ci-data-analysis.ci_data_autodl.e2e_intervals'
+    start_date = "2024-11-06"
     span = "INTERVAL 1 DAY"
     search_window_intervals = {
         "before": "INTERVAL 2 SECOND",
         "after": "INTERVAL 5 SECOND"
     }
+    job_name_matches = (
+        "4.18",
+        "gcp"
+    )
+
+    job_name_condition = " AND ".join([f'jobs.prowjob_job_name LIKE "%{entry}%"' for entry in job_name_matches])
+    d_interval_field = "IFNULL(d.interval, d.interval_json)"
+    e_interval_field = "IFNULL(e.interval, e.interval_json)"
 
     cache_file = pathlib.Path(f'cache-{start_date}.parquet')
     if cache_file.exists():
@@ -71,26 +81,33 @@ if __name__ == '__main__':
         relevant_events = f"""
 WITH disruption_events AS (
   SELECT 
-      d.prowjob_name as prowjob_name,
-      d.prowjob_build_id as prowjob_build_id,
+      jobs.prowjob_job_name as prowjob_job_name,
+      jobs.prowjob_build_id as prowjob_build_id,
+      jobs.prowjob_url as prowjob_url,
     
       d.from_time as d_from_time,
       d.to_time as d_to_time,
-      REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.message"), r'reason/([a-zA-Z0-9.-]+)') AS d_reason,
-      REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.message"), r'cause/([a-zA-Z0-9.-]+)') AS d_cause, 
-      IFNULL(REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'ns/([a-zA-Z0-9.-]+)'), REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'namespace/([a-zA-Z0-9.-]+)')) AS d_ns,
-      REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'disruption/([a-zA-Z0-9.-]+)') AS d_disruption,
-      REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'route/([a-zA-Z0-9.-]+)') AS d_route,
-      REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'connection/([a-zA-Z0-9.-]+)') AS d_connection,
-      REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'backend-disruption-name/([a-zA-Z0-9.-]+)') AS d_backend_disruption_name,
-      JSON_EXTRACT_SCALAR(d.payload, "$.message") AS d_message,
-      JSON_EXTRACT_SCALAR(d.payload, "$.locator") AS d_locator,
-      d.payload as d_payload,
+      JSON_EXTRACT_SCALAR({d_interval_field}, "$.message.reason") AS d_reason,
+      JSON_EXTRACT_SCALAR({d_interval_field}, "$.message.cause") AS d_cause, 
+      IFNULL(JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.ns")) AS d_ns,
+      JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.disruption") AS d_disruption,
+      JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.route") AS d_route,
+      JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.connection") AS d_connection,
+      JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.backend-disruption-name") AS d_backend_disruption_name,
+      JSON_EXTRACT_SCALAR({d_interval_field}, "$.message.humanMessage") AS d_message,
+      {d_interval_field} as d_payload,
   FROM 
-    `openshift-gce-devel.ci_analysis_us.job_intervals` d
+    `{intervals_table_id}` d
+  JOIN
+    `{jobs_table_id}` jobs
+  ON 
+    jobs.prowjob_build_id = d.JobRunName
   WHERE 
-    REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.message"), r'reason/([a-zA-Z0-9.-]+)') LIKE 'DisruptionBegan'
-    AND d.from_time BETWEEN DATETIME("{start_date}") AND DATETIME_ADD("{start_date}", {span})
+    JSON_EXTRACT_SCALAR({d_interval_field}, "$.message.reason") LIKE 'DisruptionBegan'
+    AND d.from_time BETWEEN TIMESTAMP("{start_date}") AND TIMESTAMP_ADD("{start_date}", {span})
+    AND jobs.prowjob_start BETWEEN DATETIME("{start_date}") AND DATETIME_ADD("{start_date}", {span})
+    AND jobs.prowjob_job_name NOT LIKE "%single-node%" 
+    AND {job_name_condition}
 ),
 numbered_disruption_events AS (
   SELECT 
@@ -112,37 +129,43 @@ SELECT
 
   e.from_time as e_from_time,
   e.to_time as e_to_time,
-  IFNULL(REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'ns/([a-zA-Z0-9.-]+)'), REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'namespace/([a-zA-Z0-9.-]+)')) AS e_ns,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'(node)/[a-zA-Z0-9.-]+') AS e_node,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'pod/([a-zA-Z0-9.-]+)') AS e_pod,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'container/([a-zA-Z0-9.-]+)') AS e_container,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'uid/([a-zA-Z0-9.-]+)') AS e_uid,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'row/([a-zA-Z0-9.-]+)') AS e_row,
+  IFNULL(JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.ns")) AS e_ns,
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.node") AS e_node,
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.pod") AS e_pod,
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.container") AS e_container,
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.uid") AS e_uid,
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.row") AS e_row,
 
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.message"), r'reason/([a-zA-Z0-9.-]+)') AS e_reason,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.message"), r'cause/([a-zA-Z0-9.-]+)') AS e_cause, 
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.message"), r'constructed/([a-zA-Z0-9.-]+)') AS e_constructed,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.message"), r'count/([a-zA-Z0-9.-]+)') AS e_count,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.message"), r'(roles?/[a-zA-Z0-9.-]*)') AS e_roles,
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") AS e_reason,
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.cause") AS e_cause, 
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.annotations.constructed") AS e_constructed,
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.count") AS e_count,
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.roles") AS e_roles,
   
-  JSON_EXTRACT_SCALAR(e.payload, "$.locator") AS e_locator,
-  JSON_EXTRACT_SCALAR(e.payload, "$.message") AS e_message,
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator") AS e_locator,
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.message") AS e_message,
 
-FROM `openshift-gce-devel.ci_analysis_us.job_intervals` e
+FROM `{intervals_table_id}` e
 JOIN d
-ON e.prowjob_build_id = d.prowjob_build_id
+ON e.JobRunName = d.prowjob_build_id
 
 WHERE 
-  JSON_EXTRACT_SCALAR(e.payload, "$.message") NOT LIKE "%reason/DisruptionBegan %"
-  AND e.from_time BETWEEN DATETIME("{start_date}") AND DATETIME_ADD("{start_date}", {span}) 
-  AND d.d_from_time BETWEEN DATETIME_SUB(e.from_time, {search_window_intervals["after"]}) AND DATETIME_ADD(e.from_time, {search_window_intervals['after']})
-ORDER BY e.prowjob_build_id, e.from_time ASC
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") NOT LIKE "Disruption%"
+  AND e.from_time BETWEEN TIMESTAMP("{start_date}") AND TIMESTAMP_ADD("{start_date}", {span}) 
+  AND d.d_from_time BETWEEN TIMESTAMP_SUB(e.from_time, {search_window_intervals["after"]}) AND TIMESTAMP_ADD(e.from_time, {search_window_intervals['after']})
+ORDER BY e.JobRunName, e.from_time ASC
 """
+        print(relevant_events)
         df = bq_client.query(relevant_events).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
         df.to_parquet(str(cache_file))
 
+    # Pods occasionally have random hex sequences. Anonymize them.
     regex = r'-[0-9a-fA-F]{8,10}(-.*|$)'
     df['e_pod'] = df['e_pod'].str.replace(regex, "-xxxxxxxxxx", regex=True)
+
+    # Nodes are based on IP usually. Anonymize them. Leave as NA if not set.
+    regex = r'[a-zA-Z0-9.-]+'
+    df['e_node'] = df['e_node'].str.replace(regex, "node", regex=True)
 
     unique_pods = df[['prowjob_build_id', 'e_pod']].drop_duplicates()
     pod_name_mapping = uniquest_prefix_in_prowjobs(unique_pods, 'e_pod')
@@ -208,19 +231,38 @@ ORDER BY e.prowjob_build_id, e.from_time ASC
         for idx, entry in enumerate(pattern):
             print(f' {idx+1}. {event_hash_to_event[entry]}')
 
-        print("Matches prowjobs:")
+        matching_prowjobs = []
         for prowjob_build_id, sequence in result.items():
             if is_subsequence(pattern, sequence):
-                print(f" - {prowjob_build_id} @ {first_rows_dict[prowjob_build_id]['d_from_time']}")
+                first_row = first_rows_dict[prowjob_build_id]
+                prowjob_info = {
+                    'id': f"{prowjob_build_id}",
+                    'time': {first_row['d_from_time']},
+                    'name': first_row['prowjob_job_name'],
+                    'url': first_row['prowjob_url'],
+                    'disruption': first_row['d_message'],
+                }
+                matching_prowjobs.append(prowjob_info)
+
+        matches_limit = 10
+        print(f"Matches prowjobs (up to {matches_limit}):")
+        pprint.pprint(matching_prowjobs[0:matches_limit])
         print()
 
     # Select relevant events around the time of the disruption
-    handy_query = """
+    handy_query = f"""
 WITH variables AS (
     SELECT 
-        DATETIME("2024-11-01 02:24:26") AS disruption_start,
-        "1852142061688459264" AS prowjob_build_id
+        TIMESTAMP("2024-11-06 00:29:50+00:00") AS disruption_start,
+        "1853950766377603072" AS prowjob_build_id
 )
-SELECT * FROM `openshift-gce-devel.ci_analysis_us.job_intervals` intervals JOIN variables ON intervals.prowjob_build_id=variables.prowjob_build_id WHERE 
-from_time BETWEEN DATETIME_SUB(variables.disruption_start, {search_window_intervals['before']}) AND DATETIME_ADD(variables.disruption_start, {search_window_intervals['after']})    
-    """
+SELECT * 
+FROM 
+    `openshift-ci-data-analysis.ci_data_autodl.e2e_intervals` intervals JOIN variables 
+ON 
+    intervals.JobRunName=variables.prowjob_build_id 
+WHERE 
+    from_time BETWEEN TIMESTAMP_SUB(variables.disruption_start, {search_window_intervals['before']}) 
+    AND TIMESTAMP_ADD(variables.disruption_start, {search_window_intervals['after']})    
+"""
+    print(handy_query)
