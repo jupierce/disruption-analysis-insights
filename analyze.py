@@ -9,6 +9,12 @@ from prefixspan import PrefixSpan
 from google.cloud import bigquery, bigquery_storage
 
 
+# Function to check if a pattern is a subsequence of a sequence
+def is_subsequence(pattern, sequence):
+    it = iter(sequence)  # When it is an iterator, all respects order of occurrence
+    return all(item in it for item in pattern)
+
+
 def uniquest_prefix_in_prowjobs(prowjob_df: pandas.DataFrame, attr: str) -> Dict[str, str]:
     """
     Given a dataframe with a column prowjob_build_id and an attribute name (e.g. 'e_pod'), return the
@@ -46,66 +52,91 @@ def uniquest_prefix_in_prowjobs(prowjob_df: pandas.DataFrame, attr: str) -> Dict
 
 if __name__ == '__main__':
 
-    cache_file = pathlib.Path('cache.parquet')
+    start_date = "2024-11-01"
+    span = "INTERVAL 1 DAY"
+    search_window_intervals = {
+        "before": "INTERVAL 2 SECOND",
+        "after": "INTERVAL 5 SECOND"
+    }
+
+    cache_file = pathlib.Path(f'cache-{start_date}.parquet')
     if cache_file.exists():
+        print('USING CACHE!')
         df = pandas.read_parquet(str(cache_file))
     else:
         bq_client = bigquery.Client(project='openshift-gce-devel')
 
-        start_date = "2024-11-01"
-        span = "INTERVAL 1 DAY"
-
+        # disruption_events includes all rows in which there is a disruption event in the specified date range.
+        # numbered_disruptions,
         relevant_events = f"""
+WITH disruption_events AS (
+  SELECT 
+      d.prowjob_name as prowjob_name,
+      d.prowjob_build_id as prowjob_build_id,
+    
+      d.from_time as d_from_time,
+      d.to_time as d_to_time,
+      REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.message"), r'reason/([a-zA-Z0-9.-]+)') AS d_reason,
+      REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.message"), r'cause/([a-zA-Z0-9.-]+)') AS d_cause, 
+      IFNULL(REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'ns/([a-zA-Z0-9.-]+)'), REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'namespace/([a-zA-Z0-9.-]+)')) AS d_ns,
+      REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'disruption/([a-zA-Z0-9.-]+)') AS d_disruption,
+      REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'route/([a-zA-Z0-9.-]+)') AS d_route,
+      REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'connection/([a-zA-Z0-9.-]+)') AS d_connection,
+      REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'backend-disruption-name/([a-zA-Z0-9.-]+)') AS d_backend_disruption_name,
+      JSON_EXTRACT_SCALAR(d.payload, "$.message") AS d_message,
+      JSON_EXTRACT_SCALAR(d.payload, "$.locator") AS d_locator,
+      d.payload as d_payload,
+  FROM 
+    `openshift-gce-devel.ci_analysis_us.job_intervals` d
+  WHERE 
+    REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.message"), r'reason/([a-zA-Z0-9.-]+)') LIKE 'DisruptionBegan'
+    AND d.from_time BETWEEN DATETIME("{start_date}") AND DATETIME_ADD("{start_date}", {span})
+),
+numbered_disruption_events AS (
+  SELECT 
+    *,
+    ROW_NUMBER() OVER (PARTITION BY prowjob_build_id ORDER BY d_from_time ASC) AS row_num
+  FROM 
+    disruption_events
+),
+d AS (
+    SELECT 
+      *
+    FROM 
+      numbered_disruption_events
+    WHERE 
+      row_num = 1
+)        
 SELECT 
-  d.prowjob_name as prowjob_name,
-  d.prowjob_build_id as prowjob_build_id,
-
-  d.from_time as d_from_time,
-  d.to_time as d_to_time,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.message"), r'reason/([a-zA-Z0-9.-]+)') AS d_reason,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.message"), r'cause/([a-zA-Z0-9.-]+)') AS d_cause, 
-  IFNULL(REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'ns/([a-zA-Z0-9.-]+)'), REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'namespace/([a-zA-Z0-9.-]+)')) AS d_ns,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'disruption/([a-zA-Z0-9.-]+)') AS d_disruption,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'route/([a-zA-Z0-9.-]+)') AS d_route,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'connection/([a-zA-Z0-9.-]+)') AS d_connection,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(d.payload, "$.locator"), r'backend-disruption-name/([a-zA-Z0-9.-]+)') AS d_backend_disruption_name,
-  JSON_EXTRACT_SCALAR(d.payload, "$.message") AS d_message,
-  JSON_EXTRACT_SCALAR(d.payload, "$.locator") AS d_locator,
-  d.payload as d_payload,
+  d.*,
 
   e.from_time as e_from_time,
   e.to_time as e_to_time,
   IFNULL(REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'ns/([a-zA-Z0-9.-]+)'), REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'namespace/([a-zA-Z0-9.-]+)')) AS e_ns,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'node/([a-zA-Z0-9.-]+)') AS e_node,
+  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'(node)/[a-zA-Z0-9.-]+') AS e_node,
   REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'pod/([a-zA-Z0-9.-]+)') AS e_pod,
   REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'container/([a-zA-Z0-9.-]+)') AS e_container,
   REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'uid/([a-zA-Z0-9.-]+)') AS e_uid,
   REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'row/([a-zA-Z0-9.-]+)') AS e_row,
 
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'disruption/([a-zA-Z0-9.-]+)') AS e_disruption,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'route/([a-zA-Z0-9.-]+)') AS e_route,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'connection/([a-zA-Z0-9.-]+)') AS e_connection,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.locator"), r'backend-disruption-name/([a-zA-Z0-9.-]+)') AS e_backend_disruption_name,
-
   REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.message"), r'reason/([a-zA-Z0-9.-]+)') AS e_reason,
   REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.message"), r'cause/([a-zA-Z0-9.-]+)') AS e_cause, 
   REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.message"), r'constructed/([a-zA-Z0-9.-]+)') AS e_constructed,
   REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.message"), r'count/([a-zA-Z0-9.-]+)') AS e_count,
-  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.message"), r'roles/([a-zA-Z0-9.-]+)') AS e_roles,
-
+  REGEXP_EXTRACT(JSON_EXTRACT_SCALAR(e.payload, "$.message"), r'(roles?/[a-zA-Z0-9.-]*)') AS e_roles,
+  
   JSON_EXTRACT_SCALAR(e.payload, "$.locator") AS e_locator,
   JSON_EXTRACT_SCALAR(e.payload, "$.message") AS e_message,
 
 FROM `openshift-gce-devel.ci_analysis_us.job_intervals` e
-JOIN `openshift-gce-devel.ci_analysis_us.job_intervals` d
+JOIN d
 ON e.prowjob_build_id = d.prowjob_build_id
 
 WHERE 
-  JSON_EXTRACT_SCALAR(d.payload, "$.message") LIKE "%reason/DisruptionBegan %"
+  JSON_EXTRACT_SCALAR(e.payload, "$.message") NOT LIKE "%reason/DisruptionBegan %"
   AND e.from_time BETWEEN DATETIME("{start_date}") AND DATETIME_ADD("{start_date}", {span}) 
-  AND d.from_time BETWEEN DATETIME("{start_date}") AND DATETIME_ADD("{start_date}", {span})
-  AND d.from_time BETWEEN DATETIME_SUB(e.from_time, INTERVAL 2 SECOND) AND DATETIME_ADD(e.from_time, INTERVAL 5 SECOND)
-ORDER BY d.prowjob_build_id, d.from_time ASC
+  AND d.d_from_time BETWEEN DATETIME_SUB(e.from_time, {search_window_intervals["after"]}) AND DATETIME_ADD(e.from_time, {search_window_intervals['after']})
+ORDER BY e.prowjob_build_id, e.from_time ASC
 """
         df = bq_client.query(relevant_events).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
         df.to_parquet(str(cache_file))
@@ -121,6 +152,7 @@ ORDER BY d.prowjob_build_id, d.from_time ASC
     df['e_pod'] = df['e_pod'].map(pod_name_mapping)
     df['e_ns'] = df['e_ns'].map(namespace_name_mapping)
     event_fields = [
+        'e_node',
         'e_ns',
         'e_pod',
         'e_container',
@@ -128,14 +160,9 @@ ORDER BY d.prowjob_build_id, d.from_time ASC
         'e_cause',
         'e_roles',
         'e_row',
-        'e_disruption',
-        'e_route',
-        'e_connection',
-        'e_backend_disruption_name'
     ]
     df = df.dropna(subset=event_fields, how='all')
     df['event'] = df[event_fields].fillna('_').astype(str).apply(lambda row: ':'.join(row), axis=1)
-    # df['event'] = df['e_ns'].fillna('') + '::' + df['e_pod'].fillna('') + '::' + df['e_container'].fillna('') + '::' + df['e_reason'].fillna('') + '::' + df['e_cause'].fillna('') + '::' + df['e_roles'].fillna('') + '::' + df['e_row'].fillna('') + '::'
 
     df['event_hash'] = pandas.util.hash_pandas_object(df['event'], index=False)
     full_def = df
@@ -147,47 +174,53 @@ ORDER BY d.prowjob_build_id, d.from_time ASC
     # Build a dictionary of event_hash=>event string to help lookup event information once the hashes are known
     event_hash_to_event: Dict[str, str] = unique_hashes.set_index('event_hash')['event'].to_dict()
 
-    # Find hashes for all types of disruption.
-    disruption_hash_rows = unique_hashes[unique_hashes['e_reason'].str.contains("DisruptionBegan", na=False)]
-    disruption_hash_map = disruption_hash_rows.set_index('event_hash')['event'].to_dict()
-    disruption_hashes_set = set(disruption_hash_map.keys())
-
     # given a dataframe with columns prowjob_build_id, event, from_time,
     # create a list of lists where each element
     # in the list is all events from a given prowjob_build_id, ordered
     # by from_time.
+    grouped_by_prowjob = df.sort_values(by='e_from_time').groupby('prowjob_build_id')
     result = (
-        df.sort_values(by='e_from_time')
-        .groupby('prowjob_build_id')['event_hash']
+        grouped_by_prowjob['event_hash']
         .apply(list)
-        .tolist()
+        .to_dict()
     )
+
+    # Group by prowjob_build_id and get the first row for each group
+    first_rows = grouped_by_prowjob.first()
+    # Convert the result to a dictionary (prowjob_build_id => first_row)
+    first_rows_dict = first_rows.to_dict(orient='index')
 
     # Create a PrefixSpan instance and mine frequent sequences
     print(f'Building PrefixSpan')
-    ps = PrefixSpan(result[0:10])
+    ps = PrefixSpan(list(result.values()))
     ps.minlen = 2
     ps.maxlen = 5
 
-    def disruptions(pattern, matches):
-        if pattern[0] in disruption_hashes_set:
-            # Patterns starting with disruption are not useful
-            return False
-        pattern_entry_set = set(pattern)
-        intersecton = disruption_hashes_set.intersection(pattern_entry_set)
-        return len(intersecton) == 1  # Only consider patterns with a single disruption entry
-
     # Find frequent patterns with a minimum support of 0.5 (50%)
     print(f'Building patterns')
-    # patterns = ps.topk(5, filter=disruptions, closed=True)
-    patterns = ps.frequent(minsup=2, filter=disruptions, closed=True)
+    patterns = ps.topk(5, closed=True)
 
     # Print the frequent patterns
     print(f'Printing patterns')
     for count, pattern in patterns:
         print(f'Count: {count}')
-        for entry in pattern:
-            print(event_hash_to_event[entry])
+        print('Events:')
+        for idx, entry in enumerate(pattern):
+            print(f' {idx+1}. {event_hash_to_event[entry]}')
+
+        print("Matches prowjobs:")
+        for prowjob_build_id, sequence in result.items():
+            if is_subsequence(pattern, sequence):
+                print(f" - {prowjob_build_id} @ {first_rows_dict[prowjob_build_id]['d_from_time']}")
         print()
 
-    # pprint.pprint(patterns)
+    # Select relevant events around the time of the disruption
+    handy_query = """
+WITH variables AS (
+    SELECT 
+        DATETIME("2024-11-01 02:24:26") AS disruption_start,
+        "1852142061688459264" AS prowjob_build_id
+)
+SELECT * FROM `openshift-gce-devel.ci_analysis_us.job_intervals` intervals JOIN variables ON intervals.prowjob_build_id=variables.prowjob_build_id WHERE 
+from_time BETWEEN DATETIME_SUB(variables.disruption_start, {search_window_intervals['before']}) AND DATETIME_ADD(variables.disruption_start, {search_window_intervals['after']})    
+    """

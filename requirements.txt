@@ -8,8 +8,9 @@ pymining
 pytrie
 
 pandas
+fastparquet
 db-dtypes
-pyarrow
+pyarrow~=14.0
 
 # bigquery progress bar
 tqdm
