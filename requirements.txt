@@ -1,0 +1,15 @@
+future~=0.18.2
+google
+google-cloud
+google-cloud-bigquery
+google-cloud-bigquery-storage
+prefixspan
+pymining
+pytrie
+
+pandas
+db-dtypes
+pyarrow
+
+# bigquery progress bar
+tqdm
