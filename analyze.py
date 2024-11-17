@@ -3,6 +3,8 @@ import os
 
 from typing import Dict
 import pathlib
+import json
+
 import pytrie
 
 import pprint
@@ -149,7 +151,7 @@ SELECT
   JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.roles") AS e_roles,
   
   JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator") AS e_locator,
-  JSON_EXTRACT_SCALAR({e_interval_field}, "$.message") AS e_message,
+  TO_JSON_STRING({e_interval_field}) AS e_payload,
 
 FROM `{intervals_table_id}` e
 JOIN d
@@ -242,13 +244,14 @@ ORDER BY e.JobRunName, e.from_time ASC
         print(f'Count: {count}')
         print('Events:')
         event_sequence = []
-        for idx, entry in enumerate(pattern):
-            event_sequence.append(event_hash_to_event[entry])
+        for event_hash in pattern:
+            event_sequence.append(event_hash_to_event[event_hash])
 
         matching_prowjobs = []
         for prowjob_build_id, sequence in result.items():
             if is_subsequence(pattern, sequence):
                 first_row = first_rows_dict[prowjob_build_id]
+                example_rows = []
                 prowjob_info = {
                     'id': f"{prowjob_build_id}",
                     'time': str(first_row['d_from_time']),
@@ -260,7 +263,11 @@ ORDER BY e.JobRunName, e.from_time ASC
                     'connection': first_row['d_connection'],
                     'route': first_row['d_route'],
                     'message': first_row['d_message'],
+                    "example_rows": example_rows,
                 }
+                for event_hash in pattern:
+                    example_row = df.query("prowjob_build_id == @prowjob_build_id and event_hash == @event_hash").iloc[0]
+                    example_rows.append(json.loads(example_row['e_payload']))
                 matching_prowjobs.append(prowjob_info)
 
         entries.append({
@@ -327,31 +334,37 @@ WHERE
                 </ol>
         
                 <h3>Prowjobs</h3>
-                <ul>
                 <div>
+                <ol>
                 {% set outer_loop = loop %}
                 {% for prowjob in entry.prowjobs %}
+                    <li>
                     <div>
                         <span class="toggle-btn" onclick="toggleDetails('{{ outer_loop.index }}-{{ loop.index }}-{{ prowjob.id }}')">
                             &#x25BC; 
                         </span>
-                        <span><a href="{{ prowjob.url }}" target="_blank">{{ prowjob.url }}</a></span>
+                        <span>{{ prowjob.name }} <a href="{{ prowjob.url }}" target="_blank">{{ prowjob.id }}</a> @ {{ prowjob.time }}</span>
                         <div class="prowjob-details" id="details-{{ outer_loop.index }}-{{ loop.index }}-{{ prowjob.id }}">
-                            <strong>ID:</strong> {{ prowjob.id }}<br>
-                            <strong>Name:</strong> {{ prowjob.name }}<br>
                             <strong>Disruption:</strong> {{ prowjob.disruption }}<br>
                             <ul>
-                                <strong>Backend:</strong> {{ prowjob.backend_disruption_name }}<br>
-                                <strong>Namespace:</strong> {{ prowjob.namespace }}<br>
-                                <strong>Connection:</strong> {{ prowjob.connection }}<br>
-                                <strong>Route:</strong> {{ prowjob.route }}<br>
-                                <strong>Message:</strong> {{ prowjob.message }}<br>
+                                <li><strong>Backend:</strong> {{ prowjob.backend_disruption_name }}
+                                <li><strong>Namespace:</strong> {{ prowjob.namespace }}
+                                <li><strong>Connection:</strong> {{ prowjob.connection }}
+                                <li><strong>Route:</strong> {{ prowjob.route }}
+                                <li><strong>Message:</strong> {{ prowjob.message }}
                             </ul>
+                            <strong>Example Qualifying Events</strong>
+                            <ol>
+                                {% for example in prowjob.example_rows %}
+                                    <li><pre> {{ example | tojson(indent=4) }} </pre> </li>
+                                {% endfor %}
+                            </ol>
                         </div>
                     </div>
+                    </li>
                 {% endfor %}
+                </ol>
                 </div>
-                </ul>
         
             </section>
         {% endfor %}
