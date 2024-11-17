@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import os
+
 from typing import Dict
 import pathlib
 import pytrie
@@ -7,6 +9,9 @@ import pprint
 import pandas
 from prefixspan import PrefixSpan
 from google.cloud import bigquery, bigquery_storage
+
+from jinja2 import Template
+import webbrowser
 
 
 # Function to check if a pattern is a subsequence of a sequence
@@ -57,7 +62,7 @@ if __name__ == '__main__':
     start_date = "2024-11-06"
     span = "INTERVAL 1 DAY"
     search_window_intervals = {
-        "before": "INTERVAL 2 SECOND",
+        "before": "INTERVAL 0 SECOND",
         "after": "INTERVAL 5 SECOND"
     }
     job_name_matches = (
@@ -129,6 +134,7 @@ SELECT
 
   e.from_time as e_from_time,
   e.to_time as e_to_time,
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.source") AS e_source,
   IFNULL(JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.ns")) AS e_ns,
   JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.node") AS e_node,
   JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.pod") AS e_pod,
@@ -165,7 +171,8 @@ ORDER BY e.JobRunName, e.from_time ASC
 
     # Nodes are based on IP usually. Anonymize them. Leave as NA if not set.
     regex = r'[a-zA-Z0-9.-]+'
-    df['e_node'] = df['e_node'].str.replace(regex, "node", regex=True)
+    df['e_node'] = df['e_node'].fillna('no')
+    df['e_node'] = df['e_node'].str.replace(regex, "yes", regex=True)
 
     unique_pods = df[['prowjob_build_id', 'e_pod']].drop_duplicates()
     pod_name_mapping = uniquest_prefix_in_prowjobs(unique_pods, 'e_pod')
@@ -175,6 +182,7 @@ ORDER BY e.JobRunName, e.from_time ASC
     df['e_pod'] = df['e_pod'].map(pod_name_mapping)
     df['e_ns'] = df['e_ns'].map(namespace_name_mapping)
     event_fields = [
+        'e_source',
         'e_node',
         'e_ns',
         'e_pod',
@@ -184,8 +192,11 @@ ORDER BY e.JobRunName, e.from_time ASC
         'e_roles',
         'e_row',
     ]
-    df = df.dropna(subset=event_fields, how='all')
-    df['event'] = df[event_fields].fillna('_').astype(str).apply(lambda row: ':'.join(row), axis=1)
+    df = df.dropna(subset=event_fields, how='all')  # Drop rows with no interesting information
+    df['event'] = df[event_fields].fillna('_').astype(str).apply(
+        lambda row: ':'.join(f"{col}={val}" for col, val in zip(row.index, row)),
+        axis=1
+    )
 
     df['event_hash'] = pandas.util.hash_pandas_object(df['event'], index=False)
     full_def = df
@@ -221,15 +232,18 @@ ORDER BY e.JobRunName, e.from_time ASC
 
     # Find frequent patterns with a minimum support of 0.5 (50%)
     print(f'Building patterns')
-    patterns = ps.topk(5, closed=True)
+    patterns = ps.topk(15, closed=True)
+
+    entries = []
 
     # Print the frequent patterns
     print(f'Printing patterns')
     for count, pattern in patterns:
         print(f'Count: {count}')
         print('Events:')
+        event_sequence = []
         for idx, entry in enumerate(pattern):
-            print(f' {idx+1}. {event_hash_to_event[entry]}')
+            event_sequence.append(event_hash_to_event[entry])
 
         matching_prowjobs = []
         for prowjob_build_id, sequence in result.items():
@@ -237,17 +251,23 @@ ORDER BY e.JobRunName, e.from_time ASC
                 first_row = first_rows_dict[prowjob_build_id]
                 prowjob_info = {
                     'id': f"{prowjob_build_id}",
-                    'time': {first_row['d_from_time']},
+                    'time': str(first_row['d_from_time']),
                     'name': first_row['prowjob_job_name'],
                     'url': first_row['prowjob_url'],
-                    'disruption': first_row['d_message'],
+                    'disruption': first_row['d_disruption'],
+                    'namespace': first_row['d_ns'],
+                    'backend_disruption_name': first_row['d_backend_disruption_name'],
+                    'connection': first_row['d_connection'],
+                    'route': first_row['d_route'],
+                    'message': first_row['d_message'],
                 }
                 matching_prowjobs.append(prowjob_info)
 
-        matches_limit = 10
-        print(f"Matches prowjobs (up to {matches_limit}):")
-        pprint.pprint(matching_prowjobs[0:matches_limit])
-        print()
+        entries.append({
+            'count': count,
+            'sequence': event_sequence,
+            'prowjobs': matching_prowjobs,
+        })
 
     # Select relevant events around the time of the disruption
     handy_query = f"""
@@ -263,6 +283,101 @@ ON
     intervals.JobRunName=variables.prowjob_build_id 
 WHERE 
     from_time BETWEEN TIMESTAMP_SUB(variables.disruption_start, {search_window_intervals['before']}) 
-    AND TIMESTAMP_ADD(variables.disruption_start, {search_window_intervals['after']})    
+    AND TIMESTAMP_ADD(variables.disruption_start, {search_window_intervals['after']})   
+    AND TO_JSON_STRING(IFNULL(`interval`, `interval_json`)) LIKE "something in pattern" 
 """
+
+    template = Template("""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>{{ title }}</title>
+        <style>
+            .prowjob-details {
+                display: none;
+                margin-top: 10px;
+                background-color: #f9f9f9;
+                padding: 10px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+            }
+            .toggle-btn {
+                cursor: pointer;
+                color: #007bff;
+            }
+        </style>        
+    </head>
+    <body>
+        <h1>Frequent Sequence Before First Disruption</h1>
+        <h2>{{ heading }}</h2>
+        
+        <br>
+        {% for entry in entries %}
+            <section>
+            
+                <h2>Pattern {{ loop.index }}</h2>
+                <h3>Occurrences: {{ entry.count }}</h3>
+                
+                <ol>
+                {% for seq in entry.sequence %}
+                    <li>{{ seq }}</li>
+                {% endfor %}
+                </ol>
+        
+                <h3>Prowjobs</h3>
+                <ul>
+                <div>
+                {% set outer_loop = loop %}
+                {% for prowjob in entry.prowjobs %}
+                    <div>
+                        <span class="toggle-btn" onclick="toggleDetails('{{ outer_loop.index }}-{{ loop.index }}-{{ prowjob.id }}')">
+                            &#x25BC; 
+                        </span>
+                        <span><a href="{{ prowjob.url }}" target="_blank">{{ prowjob.url }}</a></span>
+                        <div class="prowjob-details" id="details-{{ outer_loop.index }}-{{ loop.index }}-{{ prowjob.id }}">
+                            <strong>ID:</strong> {{ prowjob.id }}<br>
+                            <strong>Name:</strong> {{ prowjob.name }}<br>
+                            <strong>Disruption:</strong> {{ prowjob.disruption }}<br>
+                            <ul>
+                                <strong>Backend:</strong> {{ prowjob.backend_disruption_name }}<br>
+                                <strong>Namespace:</strong> {{ prowjob.namespace }}<br>
+                                <strong>Connection:</strong> {{ prowjob.connection }}<br>
+                                <strong>Route:</strong> {{ prowjob.route }}<br>
+                                <strong>Message:</strong> {{ prowjob.message }}<br>
+                            </ul>
+                        </div>
+                    </div>
+                {% endfor %}
+                </div>
+                </ul>
+        
+            </section>
+        {% endfor %}
+        
+        <script>
+            function toggleDetails(prowjobId) {
+                var details = document.getElementById("details-" + prowjobId);
+                if (details.style.display === "none" || details.style.display === "") {
+                    details.style.display = "block";
+                } else {
+                    details.style.display = "none";
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """)
+    html_content = template.render(title='Interval Insights',
+                                   heading=f'{start_date} for span {span}',
+                                   entries=entries,
+                                   )
+
+    file_path = "generated_page.html"
+    with open(file_path, "w") as file:
+        file.write(html_content)
+
+    webbrowser.open(f"file://{os.path.abspath(file_path)}")
+
     print(handy_query)

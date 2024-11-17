@@ -12,5 +12,7 @@ fastparquet
 db-dtypes
 pyarrow~=14.0
 
+jinja2
+
 # bigquery progress bar
 tqdm
