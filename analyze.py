@@ -22,6 +22,16 @@ def is_subsequence(pattern, sequence):
     return all(item in it for item in pattern)
 
 
+def anonymize_unique_strings(prowjob_df: pandas.DataFrame, attr: str) -> Dict[str, str]:
+    # Count distinct prowjob_build_id occurrences for each message
+    message_counts = df.groupby(attr)["prowjob_build_id"].nunique()
+    message_dict = {
+        message: "" if count == 1 else message
+        for message, count in message_counts.items()
+    }
+    return message_dict
+
+
 def uniquest_prefix_in_prowjobs(prowjob_df: pandas.DataFrame, attr: str) -> Dict[str, str]:
     """
     Given a dataframe with a column prowjob_build_id and an attribute name (e.g. 'e_pod'), return the
@@ -149,6 +159,7 @@ SELECT
   JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.annotations.constructed") AS e_constructed,
   JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.count") AS e_count,
   JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.roles") AS e_roles,
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.humanMessage") AS e_message,
   
   JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator") AS e_locator,
   TO_JSON_STRING({e_interval_field}) AS e_payload,
@@ -183,6 +194,13 @@ ORDER BY e.JobRunName, e.from_time ASC
 
     df['e_pod'] = df['e_pod'].map(pod_name_mapping)
     df['e_ns'] = df['e_ns'].map(namespace_name_mapping)
+
+    regex = r'[0-9a-fA-F]{8,30}'  # Anonymize any long hex string
+    df['e_message'] = df['e_message'].str.replace(regex, "xxxxxxxxxx", regex=True)
+    regex = r'[0-9]{1,30}'  # Anonymize any simple numbers
+    df['e_message'] = df['e_message'].str.replace(regex, "###", regex=True)
+    df['e_message'] = df['e_message'].map(anonymize_unique_strings(df, 'e_message'))
+
     event_fields = [
         'e_source',
         'e_node',
@@ -193,6 +211,7 @@ ORDER BY e.JobRunName, e.from_time ASC
         'e_cause',
         'e_roles',
         'e_row',
+        'e_message',
     ]
     df = df.dropna(subset=event_fields, how='all')  # Drop rows with no interesting information
     df['event'] = df[event_fields].fillna('_').astype(str).apply(
@@ -234,9 +253,22 @@ ORDER BY e.JobRunName, e.from_time ASC
 
     # Find frequent patterns with a minimum support of 0.5 (50%)
     print(f'Building patterns')
-    patterns = ps.topk(15, closed=True)
+    patterns = ps.topk(50, closed=True)
 
     entries = []
+
+    # Get a reduced dataframe only including rows for
+    # prowjobs in the report. This is all to speed up the search
+    # for qualifying events.
+    df_for_reported_prowjobs = df[
+        df["prowjob_build_id"].isin(list(result.keys()))
+    ]
+    # Group by prowjob_build_id and event_hash, and take the first occurrence for each
+    first_event_hash_occurrences = df_for_reported_prowjobs.sort_values("e_from_time").groupby(
+        ["prowjob_build_id", "event_hash"], as_index=False
+    ).first()
+    # Set the index to prowjob_build_id + event_hash for quick lookups
+    first_event_hash_occurrences.set_index(["prowjob_build_id", "event_hash"], inplace=True)
 
     # Print the frequent patterns
     print(f'Printing patterns')
@@ -247,14 +279,42 @@ ORDER BY e.JobRunName, e.from_time ASC
         for event_hash in pattern:
             event_sequence.append(event_hash_to_event[event_hash])
 
+        df_for_reported_prowjob_events = df_for_reported_prowjobs[
+            df_for_reported_prowjobs["event_hash"].isin(pattern)
+        ]
+
         matching_prowjobs = []
         for prowjob_build_id, sequence in result.items():
+            df_for_prowjob_events = df_for_reported_prowjob_events[
+                df_for_reported_prowjob_events["prowjob_build_id"] == prowjob_build_id
+            ]
             if is_subsequence(pattern, sequence):
                 first_row = first_rows_dict[prowjob_build_id]
                 example_rows = []
+
+                # Select relevant events around the time of the disruption
+                handy_query = f"""
+                WITH variables AS (
+                    SELECT 
+                        TIMESTAMP("{str(first_row['d_from_time'])}") AS disruption_start,
+                        "{prowjob_build_id}" AS prowjob_build_id
+                )
+                SELECT * 
+                FROM 
+                    `openshift-ci-data-analysis.ci_data_autodl.e2e_intervals` intervals JOIN variables 
+                ON 
+                    intervals.JobRunName=variables.prowjob_build_id 
+                WHERE 
+                    from_time BETWEEN TIMESTAMP_SUB(variables.disruption_start, {search_window_intervals['before']}) 
+                    AND TIMESTAMP_ADD(variables.disruption_start, {search_window_intervals['after']})   
+                    AND TO_JSON_STRING(IFNULL(`interval`, `interval_json`)) LIKE "%something in pattern%" 
+                ORDER BY from_time
+                """
+
                 prowjob_info = {
                     'id': f"{prowjob_build_id}",
-                    'time': str(first_row['d_from_time']),
+                    'query': handy_query,
+                    'disruption_time': str(first_row['d_from_time']),
                     'name': first_row['prowjob_job_name'],
                     'url': first_row['prowjob_url'],
                     'disruption': first_row['d_disruption'],
@@ -265,8 +325,10 @@ ORDER BY e.JobRunName, e.from_time ASC
                     'message': first_row['d_message'],
                     "example_rows": example_rows,
                 }
+
+                # TODO: This seems slow
                 for event_hash in pattern:
-                    example_row = df.query("prowjob_build_id == @prowjob_build_id and event_hash == @event_hash").iloc[0]
+                    example_row = first_event_hash_occurrences.loc[(prowjob_build_id, event_hash)]
                     example_rows.append(json.loads(example_row['e_payload']))
                 matching_prowjobs.append(prowjob_info)
 
@@ -275,24 +337,6 @@ ORDER BY e.JobRunName, e.from_time ASC
             'sequence': event_sequence,
             'prowjobs': matching_prowjobs,
         })
-
-    # Select relevant events around the time of the disruption
-    handy_query = f"""
-WITH variables AS (
-    SELECT 
-        TIMESTAMP("2024-11-06 00:29:50+00:00") AS disruption_start,
-        "1853950766377603072" AS prowjob_build_id
-)
-SELECT * 
-FROM 
-    `openshift-ci-data-analysis.ci_data_autodl.e2e_intervals` intervals JOIN variables 
-ON 
-    intervals.JobRunName=variables.prowjob_build_id 
-WHERE 
-    from_time BETWEEN TIMESTAMP_SUB(variables.disruption_start, {search_window_intervals['before']}) 
-    AND TIMESTAMP_ADD(variables.disruption_start, {search_window_intervals['after']})   
-    AND TO_JSON_STRING(IFNULL(`interval`, `interval_json`)) LIKE "something in pattern" 
-"""
 
     template = Template("""
     <!DOCTYPE html>
@@ -317,7 +361,7 @@ WHERE
         </style>        
     </head>
     <body>
-        <h1>Frequent Sequence Before First Disruption</h1>
+        <h1>Sequence Mining / Frequent Sequence Before First Disruption</h1>
         <h2>{{ heading }}</h2>
         
         <br>
@@ -329,12 +373,14 @@ WHERE
                 
                 <ol>
                 {% for seq in entry.sequence %}
-                    <li>{{ seq }}</li>
+                    <li>{{ seq | replace(':', ' ') }}</li>
                 {% endfor %}
                 </ol>
         
-                <h3>Prowjobs</h3>
-                <div>
+                <h3><span class="toggle-btn" onclick="toggleDetails('{{ loop.index }}')">
+                            &#x25BC; 
+                        </span>Prowjobs</h3>
+                <div class="prowjob-details" id="details-{{ loop.index }}">
                 <ol>
                 {% set outer_loop = loop %}
                 {% for prowjob in entry.prowjobs %}
@@ -343,16 +389,19 @@ WHERE
                         <span class="toggle-btn" onclick="toggleDetails('{{ outer_loop.index }}-{{ loop.index }}-{{ prowjob.id }}')">
                             &#x25BC; 
                         </span>
-                        <span>{{ prowjob.name }} <a href="{{ prowjob.url }}" target="_blank">{{ prowjob.id }}</a> @ {{ prowjob.time }}</span>
+                        <span>{{ prowjob.name }} <a href="{{ prowjob.url }}" target="_blank">{{ prowjob.id }}</a> {{ prowjob.backend_disruption_name }} @ {{ prowjob.disruption_time }}</span>
                         <div class="prowjob-details" id="details-{{ outer_loop.index }}-{{ loop.index }}-{{ prowjob.id }}">
                             <strong>Disruption:</strong> {{ prowjob.disruption }}<br>
                             <ul>
+                                <li><strong>Time:</strong> {{ prowjob.disruption_time }}
                                 <li><strong>Backend:</strong> {{ prowjob.backend_disruption_name }}
                                 <li><strong>Namespace:</strong> {{ prowjob.namespace }}
                                 <li><strong>Connection:</strong> {{ prowjob.connection }}
                                 <li><strong>Route:</strong> {{ prowjob.route }}
                                 <li><strong>Message:</strong> {{ prowjob.message }}
+                                <li><pre>{{ prowjob.query }}</pre>
                             </ul>
+                            <br>
                             <strong>Example Qualifying Events</strong>
                             <ol>
                                 {% for example in prowjob.example_rows %}
