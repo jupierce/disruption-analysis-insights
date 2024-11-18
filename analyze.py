@@ -93,14 +93,16 @@ if __name__ == '__main__':
     else:
         bq_client = bigquery.Client(project='openshift-gce-devel')
 
+        # first_loki_pod_created:
+        #   for each prowjob, find the to_time for successfully
         # disruption_events includes all rows in which there is a disruption event in the specified date range.
         # numbered_disruptions,
         relevant_events = f"""
 WITH disruption_events AS (
   SELECT 
-      jobs.prowjob_job_name as prowjob_job_name,
-      jobs.prowjob_build_id as prowjob_build_id,
-      jobs.prowjob_url as prowjob_url,
+    jobs.prowjob_job_name as prowjob_job_name,
+    jobs.prowjob_build_id as prowjob_build_id,
+    jobs.prowjob_url as prowjob_url,
     
       d.from_time as d_from_time,
       d.to_time as d_to_time,
@@ -121,6 +123,9 @@ WITH disruption_events AS (
     jobs.prowjob_build_id = d.JobRunName
   WHERE 
     JSON_EXTRACT_SCALAR({d_interval_field}, "$.message.reason") LIKE 'DisruptionBegan'
+    AND `source` != "e2e-events-observer.json"
+    AND JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.backend-disruption-name") NOT LIKE "%-liveness-%"
+    AND JSON_EXTRACT_SCALAR({d_interval_field}, "$.display")  = "true"
     AND d.from_time BETWEEN TIMESTAMP("{start_date}") AND TIMESTAMP_ADD("{start_date}", {span})
     AND jobs.prowjob_start BETWEEN DATETIME("{start_date}") AND DATETIME_ADD("{start_date}", {span})
     AND jobs.prowjob_job_name NOT LIKE "%single-node%" 
@@ -169,7 +174,12 @@ JOIN d
 ON e.JobRunName = d.prowjob_build_id
 
 WHERE 
-  JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") NOT LIKE "Disruption%"
+  JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") NOT LIKE "DisruptionEnded"
+  AND
+  (
+    JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") NOT LIKE "DisruptionBegan"
+    OR JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.backend-disruption-name") LIKE "%-liveness-%"
+  )
   AND e.from_time BETWEEN TIMESTAMP("{start_date}") AND TIMESTAMP_ADD("{start_date}", {span}) 
   AND d.d_from_time BETWEEN TIMESTAMP_SUB(e.from_time, {search_window_intervals["after"]}) AND TIMESTAMP_ADD(e.from_time, {search_window_intervals['after']})
 ORDER BY e.JobRunName, e.from_time ASC
