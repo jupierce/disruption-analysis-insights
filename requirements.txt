@@ -10,7 +10,7 @@ pytrie
 pandas
 fastparquet
 db-dtypes
-pyarrow~=14.0
+pyarrow~=18.0
 
 jinja2
 
