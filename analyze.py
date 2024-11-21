@@ -92,7 +92,7 @@ if __name__ == '__main__':
     partials = []  # rendered partial templates for each disruption
     cache_dir = pathlib.Path('cache')
     cache_dir.mkdir(exist_ok=True)
-    for target_disruption_index, target_disruption_match in enumerate(['service-load-balancer-%', 'ingress-to-%', 'cache-kube-api-%', 'cache-%', 'kube-api-%', 'openshift-api-%', 'oauth-api-%']):
+    for target_disruption_index, target_disruption_match in enumerate(['service-load-balancer-%', 'ingress-to-%', 'cache-kube-api-%', 'cache-%', 'kube-api-%', 'openshift-api-%', 'oauth-api-%', 'host-to-%', 'pod-to-%']):
 
         cache_file = cache_dir.joinpath(f'cache-{start_date}.{target_disruption_match}')
         if cache_file.exists():
@@ -193,18 +193,65 @@ if __name__ == '__main__':
       AND NOT (
         # Service load balancer disruption usually indicate a master node going down.
         # The kube-apiserver is heavily instrumented and is reporting node going down.
-        # Just filter these. 
+        # Just filter these. Same for CSI drivers and openshift-iamge-registry. 
         d.d_backend_disruption_name = "service-load-balancer-with-pdb-reused-connections" AND 
-        JSON_EXTRACT_SCALAR({e_interval_field}, "$.source") = "KubeEvent" AND
-        IFNULL(JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.ns")) = "openshift-kube-apiserver"
+        (
+            (
+                JSON_EXTRACT_SCALAR({e_interval_field}, "$.source") = "KubeEvent" AND
+                (
+                    (
+                        # Namespaces likely to complain when node is down.
+                        IFNULL(JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.ns")) = "openshift-kube-apiserver"
+                        OR
+                        IFNULL(JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.ns")) = "openshift-image-registry"
+                        OR 
+                        IFNULL(JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.ns")) = "openshift-cluster-csi-drivers"
+                    )
+                    OR
+                    (
+                        # Scheduling is going to fail while node is down.
+                        JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") = "FailedScheduling"
+                    )
+                )
+            ) 
+            OR 
+            (
+                # etcd is also generating noise we can filter at this time.
+                JSON_EXTRACT_SCALAR({e_interval_field}, "$.source") = "EtcdLog"
+            )
+            OR 
+            (
+                # Alerts for KubeScheduling 
+                JSON_EXTRACT_SCALAR({e_interval_field}, "$.source") = "Alert"
+                AND
+                JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.humanMessage") LIKE "%KubeDaemon%"
+            )
+        )
       )
       AND e.from_time BETWEEN TIMESTAMP("{start_date}") AND TIMESTAMP_ADD("{start_date}", {span}) 
       AND d.d_from_time BETWEEN TIMESTAMP_SUB(e.from_time, {search_window_intervals["before"]}) AND TIMESTAMP_ADD(e.from_time, {search_window_intervals['after']})
+      
     ORDER BY e.JobRunName, e.from_time ASC
     """
             print(relevant_events)
-            df = bq_client.query(relevant_events).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
+            query_results = bq_client.query(relevant_events)
+            if query_results.result().total_rows > 0:
+                df = query_results = query_results.to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
+            else:
+                df = pandas.DataFrame()
             df.to_parquet(str(cache_file))
+
+        if len(df.index) == 0:
+            template = Template("""
+                <br>
+                <h2> Patterns for disruption LIKE {{ target_disruption_match }}</h2>
+                <div style="padding-left:20px;">
+                    No matching disruptions found in search.
+                </div>
+                <br>
+            """)
+            partials.append(template.render(target_disruption_match=target_disruption_match))
+            continue
 
         # Pods occasionally have random hex sequences. Anonymize them.
         regex = r'-[0-9a-fA-F]{8,10}(-.*|$)'
@@ -250,6 +297,12 @@ if __name__ == '__main__':
 
         df['event_hash'] = pandas.util.hash_pandas_object(df['event'], index=False)
         full_def = df
+
+        # Sorting on fields after from_time ensures that if a sequence of messages occurs in the same
+        # second, they are sorted, and thus can be consistent between more prowjobs (leading to
+        # additional occurrences).
+        df = df.sort_values(by=['prowjob_build_id', 'e_from_time', 'e_from_time', 'e_source', 'e_ns', 'e_reason', 'e_message'])
+
         # Remove sequential rows with the same prowjob_build_id and event_hash.
         df = df[df[['prowjob_build_id', 'event_hash']].ne(df[['prowjob_build_id', 'event_hash']].shift()).any(axis=1)]
 
@@ -262,7 +315,8 @@ if __name__ == '__main__':
         # create a list of lists where each element
         # in the list is all events from a given prowjob_build_id, ordered
         # by from_time.
-        grouped_by_prowjob = df.sort_values(by='e_from_time').groupby('prowjob_build_id')
+        grouped_by_prowjob = df.groupby('prowjob_build_id', sort=False)
+
         result = (
             grouped_by_prowjob['event_hash']
             .apply(list)
@@ -277,7 +331,7 @@ if __name__ == '__main__':
         # Create a PrefixSpan instance and mine frequent sequences
         print(f'Building PrefixSpan')
         ps = PrefixSpan(list(result.values()))
-        ps.minlen = 2
+        ps.minlen = 1
         ps.maxlen = 10
 
         # Find frequent patterns with a minimum support of 0.5 (50%)
@@ -362,11 +416,12 @@ if __name__ == '__main__':
                         example_rows.append(json.loads(example_row['e_payload']))
                     matching_prowjobs.append(prowjob_info)
 
-            entries.append({
-                'count': count,
-                'sequence': event_sequence,
-                'prowjobs': matching_prowjobs,
-            })
+            if count > 1:
+                entries.append({
+                    'count': count,
+                    'sequence': event_sequence,
+                    'prowjobs': matching_prowjobs,
+                })
 
         template = Template("""
             <br>
