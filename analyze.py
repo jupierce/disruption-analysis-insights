@@ -74,8 +74,8 @@ if __name__ == '__main__':
     start_date = "2024-11-06"
     span = "INTERVAL 1 DAY"
     search_window_intervals = {
-        "before": "INTERVAL 0 SECOND",
-        "after": "INTERVAL 5 SECOND"
+        "before": "INTERVAL 1 SECOND",  # Include events that the disruption was slightly before
+        "after": "INTERVAL 15 SECOND"  # Include events that the disruption was slightly after
     }
     job_name_matches = (
         "4.18",
@@ -180,8 +180,13 @@ WHERE
     JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") NOT LIKE "DisruptionBegan"
     OR JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.backend-disruption-name") LIKE "%-liveness-%"
   )
+  AND NOT (
+    d.d_backend_disruption_name = "service-load-balancer-with-pdb-reused-connections" AND 
+    JSON_EXTRACT_SCALAR({e_interval_field}, "$.source") = "KubeEvent" AND
+    IFNULL(JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.ns")) = "openshift-kube-apiserver"
+  )
   AND e.from_time BETWEEN TIMESTAMP("{start_date}") AND TIMESTAMP_ADD("{start_date}", {span}) 
-  AND d.d_from_time BETWEEN TIMESTAMP_SUB(e.from_time, {search_window_intervals["after"]}) AND TIMESTAMP_ADD(e.from_time, {search_window_intervals['after']})
+  AND d.d_from_time BETWEEN TIMESTAMP_SUB(e.from_time, {search_window_intervals["before"]}) AND TIMESTAMP_ADD(e.from_time, {search_window_intervals['after']})
 ORDER BY e.JobRunName, e.from_time ASC
 """
         print(relevant_events)
@@ -259,7 +264,7 @@ ORDER BY e.JobRunName, e.from_time ASC
     print(f'Building PrefixSpan')
     ps = PrefixSpan(list(result.values()))
     ps.minlen = 2
-    ps.maxlen = 5
+    ps.maxlen = 10
 
     # Find frequent patterns with a minimum support of 0.5 (50%)
     print(f'Building patterns')
@@ -304,22 +309,23 @@ ORDER BY e.JobRunName, e.from_time ASC
 
                 # Select relevant events around the time of the disruption
                 handy_query = f"""
-                WITH variables AS (
-                    SELECT 
-                        TIMESTAMP("{str(first_row['d_from_time'])}") AS disruption_start,
-                        "{prowjob_build_id}" AS prowjob_build_id
-                )
-                SELECT * 
-                FROM 
-                    `openshift-ci-data-analysis.ci_data_autodl.e2e_intervals` intervals JOIN variables 
-                ON 
-                    intervals.JobRunName=variables.prowjob_build_id 
-                WHERE 
-                    from_time BETWEEN TIMESTAMP_SUB(variables.disruption_start, {search_window_intervals['before']}) 
-                    AND TIMESTAMP_ADD(variables.disruption_start, {search_window_intervals['after']})   
-                    AND TO_JSON_STRING(IFNULL(`interval`, `interval_json`)) LIKE "%something in pattern%" 
-                ORDER BY from_time
-                """
+WITH variables AS (
+    SELECT 
+        TIMESTAMP("{str(first_row['d_from_time'])}") AS disruption_start,
+        "{prowjob_build_id}" AS prowjob_build_id
+)
+SELECT * 
+FROM 
+    `openshift-ci-data-analysis.ci_data_autodl.e2e_intervals` intervals JOIN variables 
+ON 
+    intervals.JobRunName=variables.prowjob_build_id 
+WHERE 
+    from_time BETWEEN TIMESTAMP_SUB(variables.disruption_start, {search_window_intervals['after']}) 
+    AND TIMESTAMP_ADD(variables.disruption_start, {search_window_intervals['before']})   
+    AND `source` != "e2e-events-observer.json"
+    # AND TO_JSON_STRING(IFNULL(`interval`, `interval_json`)) LIKE "%something in interval%" 
+ORDER BY from_time
+"""
 
                 prowjob_info = {
                     'id': f"{prowjob_build_id}",
@@ -373,6 +379,7 @@ ORDER BY e.JobRunName, e.from_time ASC
     <body>
         <h1>Sequence Mining / Frequent Sequence Before First Disruption</h1>
         <h2>{{ heading }}</h2>
+        <h2>{{ constraints }}</h2>
         
         <br>
         {% for entry in entries %}
@@ -409,8 +416,10 @@ ORDER BY e.JobRunName, e.from_time ASC
                                 <li><strong>Connection:</strong> {{ prowjob.connection }}
                                 <li><strong>Route:</strong> {{ prowjob.route }}
                                 <li><strong>Message:</strong> {{ prowjob.message }}
-                                <li><pre>{{ prowjob.query }}</pre>
                             </ul>
+                            <br>
+                            <strong>Events in search window:</strong> 
+                            <pre>{{ prowjob.query }}</pre>
                             <br>
                             <strong>Example Qualifying Events</strong>
                             <ol>
@@ -443,6 +452,7 @@ ORDER BY e.JobRunName, e.from_time ASC
     """)
     html_content = template.render(title='Interval Insights',
                                    heading=f'{start_date} for span {span}',
+                                   constraints=f'Events up to {search_window_intervals["after"]} before disruption and {search_window_intervals["before"]} after disruption',
                                    entries=entries,
                                    )
 
