@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import os
 import hashlib
+from enum import Enum
 
-from typing import Dict
+from typing import Dict, Optional, List
 import pathlib
 import json
 
@@ -68,21 +69,95 @@ def uniquest_prefix_in_prowjobs(prowjob_df: pandas.DataFrame, attr: str) -> Dict
     return name_mapping
 
 
+class IntervalPaths(Enum):
+    LEVEL = '$.level'
+    SOURCE = '$.source'
+    REASON = '$.message.reason'
+    DISPLAY = '$.display'
+    CAUSE = '$.message.cause'
+    LOCATOR_TYPE = '$.locator.type'
+    KEYS_DISRUPTION = '$.locator.keys.disruption'
+    KEYS_ROUTE = '$.locator.keys.route'
+    KEYS_CONNECTION = '$.locator.keys.connection'
+    KEYS_BACKEND_DISRUPTION_NAME = '$.locator.keys.backend-disruption-name'
+    MESSAGE_HUMAN_MESSAGE = "$.message.humanMessage"
+
+
+class AbstractFieldCriterion:
+    def render(self, column_name: str):
+        raise NotImplemented('Render on abstract class')
+
+
+class JsonFieldCriterion(AbstractFieldCriterion):
+    def __init__(self, json_path: IntervalPaths, value, operator: str = "="):
+        self.json_path = json_path
+        self.value = value
+        if type(self.value) == str:
+            self.value = '"' + self.value + '"'
+        if type(self.value) == bool:
+            self.value = 'true' if self.value else 'false'
+        self.operator = operator
+
+    def render(self, column_name: str):
+        return f'JSON_EXTRACT_SCALAR({column_name}, "{self.json_path.value}") {self.operator} {self.value}'
+
+    def __str__(self):
+        return f'{self.json_path.name} {self.operator} {self.value}'
+
+
+class NamespaceCriterion:
+    def __init__(self, namespace: str, operator: str = "="):
+        self.namespace = namespace
+        self.operator = operator
+
+    def render(self, column_name: str):
+        return f'IFNULL(JSON_EXTRACT_SCALAR({column_name}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({column_name}, "$.locator.keys.ns")) {self.operator} "{self.namespace}"'
+
+    def __str__(self):
+        return f'namespace {self.operator} {self.namespace}'
+
+
+class IntervalCriteria:
+    def __init__(self, *fcs: JsonFieldCriterion):
+        self.fcs: List[JsonFieldCriterion] = list(fcs)
+
+    def render(self, column_name: str):
+        expressions: List[str] = []
+        for fc in self.fcs:
+            expressions.append(fc.render(column_name))
+        return ' AND '.join(expressions)
+
+    def __str__(self):
+        conds = []
+        for fc in self.fcs:
+            conds.append(str(fc))
+        return '[' + 'AND'.join(conds) + ']'
+
+
+class DisruptionCriteria(IntervalCriteria):
+    def __init__(self, backend_disruption_like: str, *fcs: JsonFieldCriterion):
+        super().__init__(*fcs)
+        self.backend_disruption_like = backend_disruption_like
+        self.fcs.append(JsonFieldCriterion(IntervalPaths.KEYS_BACKEND_DISRUPTION_NAME, backend_disruption_like, operator='LIKE'))
+        self.fcs.append(JsonFieldCriterion(IntervalPaths.REASON, 'DisruptionBegan'))
+        self.fcs.append(JsonFieldCriterion(IntervalPaths.DISPLAY, True))
+
+
 if __name__ == '__main__':
 
     jobs_table_id = 'openshift-gce-devel.ci_analysis_us.jobs'
     intervals_table_id = 'openshift-ci-data-analysis.ci_data_autodl.e2e_intervals'
-    start_date = "2024-11-06"
-    span = "INTERVAL 1 DAY"
+    start_date = "2024-11-11"
+    span = "INTERVAL 5 DAY"
 
     search_window_intervals = {
         "before": "INTERVAL 1 SECOND",  # Include events that the disruption was slightly before
-        "after": "INTERVAL 15 SECOND"  # Include events that the disruption was slightly after
+        "after": "INTERVAL 180 SECOND"  # Include events that the disruption was slightly after
     }
 
     job_name_matches = (
         "4.18",
-        "gcp"
+        "vsphere"
     )
 
     job_name_condition = " AND ".join([f'jobs.prowjob_job_name LIKE "%{entry}%"' for entry in job_name_matches])
@@ -92,147 +167,147 @@ if __name__ == '__main__':
     partials = []  # rendered partial templates for each disruption
     cache_dir = pathlib.Path('cache')
     cache_dir.mkdir(exist_ok=True)
-    for target_disruption_index, target_disruption_match in enumerate(['service-load-balancer-%', 'ingress-to-%', 'cache-kube-api-%', 'cache-%', 'kube-api-%', 'openshift-api-%', 'oauth-api-%', 'host-to-%', 'pod-to-%']):
+    for target_interval_index, target_interval_criteria in enumerate([
+        IntervalCriteria(JsonFieldCriterion(IntervalPaths.SOURCE, 'NodeUnexpectedNotReady'))
+    ]):
 
-        cache_file = cache_dir.joinpath(f'cache-{start_date}.{target_disruption_match}')
+        relevant_events = f"""
+        WITH disruption_events AS (
+          SELECT 
+            jobs.prowjob_job_name as prowjob_job_name,
+            jobs.prowjob_build_id as prowjob_build_id,
+            jobs.prowjob_url as prowjob_url,
+
+              d.from_time as d_from_time,
+              d.to_time as d_to_time,
+              JSON_EXTRACT_SCALAR({d_interval_field}, "$.message.reason") AS d_reason,
+              JSON_EXTRACT_SCALAR({d_interval_field}, "$.message.cause") AS d_cause, 
+              IFNULL(JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.ns")) AS d_ns,
+              JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.disruption") AS d_disruption,
+              JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.route") AS d_route,
+              JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.connection") AS d_connection,
+              JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.backend-disruption-name") AS d_backend_disruption_name,
+              JSON_EXTRACT_SCALAR({d_interval_field}, "$.message.humanMessage") AS d_message,
+              {d_interval_field} as d_payload,
+          FROM 
+            `{intervals_table_id}` d
+          JOIN
+            `{jobs_table_id}` jobs
+          ON 
+            jobs.prowjob_build_id = d.JobRunName
+          WHERE 
+            `source` != "e2e-events-observer.json"
+            AND JSON_EXTRACT_SCALAR({d_interval_field}, "$.display")  = "true"
+            AND d.from_time BETWEEN TIMESTAMP("{start_date}") AND TIMESTAMP_ADD("{start_date}", {span})
+            AND jobs.prowjob_start BETWEEN DATETIME("{start_date}") AND DATETIME_ADD("{start_date}", {span})
+            AND jobs.prowjob_job_name NOT LIKE "%single-node%" 
+            AND {job_name_condition}
+            AND {target_interval_criteria.render(d_interval_field)}
+        ),
+        numbered_disruption_events AS (
+          SELECT 
+            *,
+            ROW_NUMBER() OVER (PARTITION BY prowjob_build_id ORDER BY d_from_time ASC) AS row_num
+          FROM 
+            disruption_events
+        ),
+        d AS (
+            SELECT 
+              *
+            FROM 
+              numbered_disruption_events
+            WHERE 
+              row_num = 1
+        )        
+        SELECT 
+          d.*,
+
+          e.from_time as e_from_time,
+          e.to_time as e_to_time,
+          IF(TIMESTAMP_DIFF(d_from_time, e.from_time, SECOND) = 0, "at_d", IF(TIMESTAMP_DIFF(d_from_time, e.from_time, SECOND) <= 0, "after_d", "before_d")) as e_diff,
+          JSON_EXTRACT_SCALAR({e_interval_field}, "$.source") AS e_source,
+          IFNULL(JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.ns")) AS e_ns,
+          JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.node") AS e_node,
+          JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.pod") AS e_pod,
+          JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.container") AS e_container,
+          JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.uid") AS e_uid,
+          JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.row") AS e_row,
+
+          JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") AS e_reason,
+          JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.cause") AS e_cause, 
+          JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.annotations.constructed") AS e_constructed,
+          JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.count") AS e_count,
+          JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.roles") AS e_roles,
+          JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.humanMessage") AS e_message,
+
+          JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator") AS e_locator,
+          TO_JSON_STRING({e_interval_field}) AS e_payload,
+
+        FROM `{intervals_table_id}` e
+        JOIN d
+        ON e.JobRunName = d.prowjob_build_id
+
+        WHERE 
+          JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") NOT LIKE "DisruptionEnded"
+          AND
+          (
+            JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") NOT LIKE "DisruptionBegan"
+            OR JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.backend-disruption-name") LIKE "%-liveness-%"
+          )
+          AND NOT (
+            # Service load balancer disruption usually indicate a master node going down.
+            # The kube-apiserver is heavily instrumented and is reporting node going down.
+            # Just filter these. Same for CSI drivers and openshift-iamge-registry. 
+            d.d_backend_disruption_name = "service-load-balancer-with-pdb-reused-connections" AND 
+            (
+                (
+                    JSON_EXTRACT_SCALAR({e_interval_field}, "$.source") = "KubeEvent" AND
+                    (
+                        (
+                            # Namespaces likely to complain when node is down.
+                            IFNULL(JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.ns")) = "openshift-kube-apiserver"
+                            OR
+                            IFNULL(JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.ns")) = "openshift-image-registry"
+                            OR 
+                            IFNULL(JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.ns")) = "openshift-cluster-csi-drivers"
+                        )
+                        OR
+                        (
+                            # Scheduling is going to fail while node is down.
+                            JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") = "FailedScheduling"
+                        )
+                    )
+                ) 
+                OR 
+                (
+                    # etcd is also generating noise we can filter at this time.
+                    JSON_EXTRACT_SCALAR({e_interval_field}, "$.source") = "EtcdLog"
+                )
+                OR 
+                (
+                    # Alerts for KubeScheduling 
+                    JSON_EXTRACT_SCALAR({e_interval_field}, "$.source") = "Alert"
+                    AND
+                    JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.humanMessage") LIKE "%KubeDaemon%"
+                )
+            )
+          )
+          AND e.from_time BETWEEN TIMESTAMP("{start_date}") AND TIMESTAMP_ADD("{start_date}", {span}) 
+          AND d.d_from_time BETWEEN TIMESTAMP_SUB(e.from_time, {search_window_intervals["before"]}) AND TIMESTAMP_ADD(e.from_time, {search_window_intervals['after']})
+
+        ORDER BY e.JobRunName, e.from_time ASC
+        """
+
+        query_hash = hashlib.md5()
+        query_hash.update(relevant_events.encode('utf-8'))
+
+        cache_file = cache_dir.joinpath(f'cache-{query_hash.hexdigest()}')
         if cache_file.exists():
             print('USING CACHE!')
             df = pandas.read_parquet(str(cache_file))
         else:
             bq_client = bigquery.Client(project='openshift-gce-devel')
 
-            # first_loki_pod_created:
-            #   for each prowjob, find the to_time for successfully
-            # disruption_events includes all rows in which there is a disruption event in the specified date range.
-            # numbered_disruptions,
-            relevant_events = f"""
-    WITH disruption_events AS (
-      SELECT 
-        jobs.prowjob_job_name as prowjob_job_name,
-        jobs.prowjob_build_id as prowjob_build_id,
-        jobs.prowjob_url as prowjob_url,
-        
-          d.from_time as d_from_time,
-          d.to_time as d_to_time,
-          JSON_EXTRACT_SCALAR({d_interval_field}, "$.message.reason") AS d_reason,
-          JSON_EXTRACT_SCALAR({d_interval_field}, "$.message.cause") AS d_cause, 
-          IFNULL(JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.ns")) AS d_ns,
-          JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.disruption") AS d_disruption,
-          JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.route") AS d_route,
-          JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.connection") AS d_connection,
-          JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.backend-disruption-name") AS d_backend_disruption_name,
-          JSON_EXTRACT_SCALAR({d_interval_field}, "$.message.humanMessage") AS d_message,
-          {d_interval_field} as d_payload,
-      FROM 
-        `{intervals_table_id}` d
-      JOIN
-        `{jobs_table_id}` jobs
-      ON 
-        jobs.prowjob_build_id = d.JobRunName
-      WHERE 
-        JSON_EXTRACT_SCALAR({d_interval_field}, "$.message.reason") LIKE 'DisruptionBegan'
-        AND `source` != "e2e-events-observer.json"
-        AND JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.backend-disruption-name") NOT LIKE "%-liveness-%"
-        AND JSON_EXTRACT_SCALAR({d_interval_field}, "$.display")  = "true"
-        AND d.from_time BETWEEN TIMESTAMP("{start_date}") AND TIMESTAMP_ADD("{start_date}", {span})
-        AND jobs.prowjob_start BETWEEN DATETIME("{start_date}") AND DATETIME_ADD("{start_date}", {span})
-        AND jobs.prowjob_job_name NOT LIKE "%single-node%" 
-        AND {job_name_condition}
-        AND JSON_EXTRACT_SCALAR({d_interval_field}, "$.locator.keys.backend-disruption-name") LIKE "{target_disruption_match}"
-    ),
-    numbered_disruption_events AS (
-      SELECT 
-        *,
-        ROW_NUMBER() OVER (PARTITION BY prowjob_build_id ORDER BY d_from_time ASC) AS row_num
-      FROM 
-        disruption_events
-    ),
-    d AS (
-        SELECT 
-          *
-        FROM 
-          numbered_disruption_events
-        WHERE 
-          row_num = 1
-    )        
-    SELECT 
-      d.*,
-    
-      e.from_time as e_from_time,
-      e.to_time as e_to_time,
-      IF(TIMESTAMP_DIFF(d_from_time, e.from_time, SECOND) = 0, "at_d", IF(TIMESTAMP_DIFF(d_from_time, e.from_time, SECOND) <= 0, "after_d", "before_d")) as e_diff,
-      JSON_EXTRACT_SCALAR({e_interval_field}, "$.source") AS e_source,
-      IFNULL(JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.ns")) AS e_ns,
-      JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.node") AS e_node,
-      JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.pod") AS e_pod,
-      JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.container") AS e_container,
-      JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.uid") AS e_uid,
-      JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.row") AS e_row,
-    
-      JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") AS e_reason,
-      JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.cause") AS e_cause, 
-      JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.annotations.constructed") AS e_constructed,
-      JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.count") AS e_count,
-      JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.roles") AS e_roles,
-      JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.humanMessage") AS e_message,
-      
-      JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator") AS e_locator,
-      TO_JSON_STRING({e_interval_field}) AS e_payload,
-    
-    FROM `{intervals_table_id}` e
-    JOIN d
-    ON e.JobRunName = d.prowjob_build_id
-    
-    WHERE 
-      JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") NOT LIKE "DisruptionEnded"
-      AND
-      (
-        JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") NOT LIKE "DisruptionBegan"
-        OR JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.backend-disruption-name") LIKE "%-liveness-%"
-      )
-      AND NOT (
-        # Service load balancer disruption usually indicate a master node going down.
-        # The kube-apiserver is heavily instrumented and is reporting node going down.
-        # Just filter these. Same for CSI drivers and openshift-iamge-registry. 
-        d.d_backend_disruption_name = "service-load-balancer-with-pdb-reused-connections" AND 
-        (
-            (
-                JSON_EXTRACT_SCALAR({e_interval_field}, "$.source") = "KubeEvent" AND
-                (
-                    (
-                        # Namespaces likely to complain when node is down.
-                        IFNULL(JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.ns")) = "openshift-kube-apiserver"
-                        OR
-                        IFNULL(JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.ns")) = "openshift-image-registry"
-                        OR 
-                        IFNULL(JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.namespace"), JSON_EXTRACT_SCALAR({e_interval_field}, "$.locator.keys.ns")) = "openshift-cluster-csi-drivers"
-                    )
-                    OR
-                    (
-                        # Scheduling is going to fail while node is down.
-                        JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") = "FailedScheduling"
-                    )
-                )
-            ) 
-            OR 
-            (
-                # etcd is also generating noise we can filter at this time.
-                JSON_EXTRACT_SCALAR({e_interval_field}, "$.source") = "EtcdLog"
-            )
-            OR 
-            (
-                # Alerts for KubeScheduling 
-                JSON_EXTRACT_SCALAR({e_interval_field}, "$.source") = "Alert"
-                AND
-                JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.humanMessage") LIKE "%KubeDaemon%"
-            )
-        )
-      )
-      AND e.from_time BETWEEN TIMESTAMP("{start_date}") AND TIMESTAMP_ADD("{start_date}", {span}) 
-      AND d.d_from_time BETWEEN TIMESTAMP_SUB(e.from_time, {search_window_intervals["before"]}) AND TIMESTAMP_ADD(e.from_time, {search_window_intervals['after']})
-      
-    ORDER BY e.JobRunName, e.from_time ASC
-    """
             print(relevant_events)
             query_results = bq_client.query(relevant_events)
             if query_results.result().total_rows > 0:
@@ -244,13 +319,13 @@ if __name__ == '__main__':
         if len(df.index) == 0:
             template = Template("""
                 <br>
-                <h2> Patterns for disruption LIKE {{ target_disruption_match }}</h2>
+                <h2> Patterns for target interval {{ target_disruption_match }}</h2>
                 <div style="padding-left:20px;">
-                    No matching disruptions found in search.
+                    No matching intervals found in search.
                 </div>
                 <br>
             """)
-            partials.append(template.render(target_disruption_match=target_disruption_match))
+            partials.append(template.render(target_disruption_match=target_interval_criteria))
             continue
 
         # Pods occasionally have random hex sequences. Anonymize them.
@@ -301,7 +376,7 @@ if __name__ == '__main__':
         # Sorting on fields after from_time ensures that if a sequence of messages occurs in the same
         # second, they are sorted, and thus can be consistent between more prowjobs (leading to
         # additional occurrences).
-        df = df.sort_values(by=['prowjob_build_id', 'e_from_time', 'e_from_time', 'e_source', 'e_ns', 'e_reason', 'e_message'])
+        df = df.sort_values(by=['prowjob_build_id', 'e_from_time', 'e_source', 'e_ns', 'e_reason', 'e_message'])
 
         # Remove sequential rows with the same prowjob_build_id and event_hash.
         df = df[df[['prowjob_build_id', 'event_hash']].ne(df[['prowjob_build_id', 'event_hash']].shift()).any(axis=1)]
@@ -331,8 +406,8 @@ if __name__ == '__main__':
         # Create a PrefixSpan instance and mine frequent sequences
         print(f'Building PrefixSpan')
         ps = PrefixSpan(list(result.values()))
-        ps.minlen = 1
-        ps.maxlen = 10
+        # ps.minlen = 1
+        # ps.maxlen = 10
 
         # Find frequent patterns with a minimum support of 0.5 (50%)
         print(f'Building patterns')
@@ -401,16 +476,10 @@ if __name__ == '__main__':
                         'disruption_time': str(first_row['d_from_time']),
                         'name': first_row['prowjob_job_name'],
                         'url': first_row['prowjob_url'],
-                        'disruption': first_row['d_disruption'],
-                        'namespace': first_row['d_ns'],
-                        'backend_disruption_name': first_row['d_backend_disruption_name'],
-                        'connection': first_row['d_connection'],
-                        'route': first_row['d_route'],
-                        'message': first_row['d_message'],
+                        'target_payload': json.loads(first_row['d_payload']),
                         "example_rows": example_rows,
                     }
 
-                    # TODO: This seems slow
                     for event_hash in pattern:
                         example_row = first_event_hash_occurrences.loc[(prowjob_build_id, event_hash)]
                         example_rows.append(json.loads(example_row['e_payload']))
@@ -427,7 +496,7 @@ if __name__ == '__main__':
             <br>
             <h2><span class="toggle-btn" onclick="toggleDetails('disruption-{{ target_disruption_index }}')">
                                 &#x25BC; 
-                            </span> Patterns for disruption LIKE {{ target_disruption_match }}</h2>
+                            </span> Patterns for target interval {{ target_disruption_match }} ({{ total_matching_prowjobs }} matching jobs)</h2>
             <div style="padding-left:20px;" class="prowjob-details" id="details-disruption-{{ target_disruption_index }}">
             
             <br>
@@ -435,7 +504,7 @@ if __name__ == '__main__':
                 <section>
                 
                     <h2>Pattern {{ loop.index }}</h2>
-                    <h3>Occurrences: {{ entry.count }}</h3>
+                    <h3>Occurrences: {{ entry.count }} ({{ entry.count * 100 // total_matching_prowjobs }}% of matching jobs)</h3>
                     
                     
                     <ol>
@@ -458,25 +527,18 @@ if __name__ == '__main__':
                             </span>
                             <span>{{ prowjob.name }} <a href="{{ prowjob.url }}" target="_blank">{{ prowjob.id }}</a> {{ prowjob.backend_disruption_name }} @ {{ prowjob.disruption_time }}</span>
                             <div class="prowjob-details" id="details-{{ target_disruption_index }}-{{ outer_loop.index }}-{{ loop.index }}-{{ prowjob.id }}">
-                                <strong>Disruption:</strong> {{ prowjob.disruption }}<br>
-                                <ul>
-                                    <li><strong>Time:</strong> {{ prowjob.disruption_time }}
-                                    <li><strong>Backend:</strong> {{ prowjob.backend_disruption_name }}
-                                    <li><strong>Namespace:</strong> {{ prowjob.namespace }}
-                                    <li><strong>Connection:</strong> {{ prowjob.connection }}
-                                    <li><strong>Route:</strong> {{ prowjob.route }}
-                                    <li><strong>Message:</strong> {{ prowjob.message }}
-                                </ul>
+                                <strong>Matching Interval:</strong>
+                                <pre>{{ prowjob.target_payload | tojson(indent=4) }}</pre>
                                 <br>
-                                <strong>Events in search window:</strong> 
-                                <pre>{{ prowjob.query }}</pre>
-                                <br>
-                                <strong>Example Qualifying Events</strong>
+                                <strong>Qualifying Pattern Intervals</strong>
                                 <ol>
                                     {% for example in prowjob.example_rows %}
                                         <li><pre> {{ example | tojson(indent=4) }} </pre> </li>
                                     {% endfor %}
                                 </ol>
+                                <br>
+                                <strong>All Intervals In Search Window:</strong> 
+                                <pre>{{ prowjob.query }}</pre>
                             </div>
                         </div>
                         </li>
@@ -490,8 +552,9 @@ if __name__ == '__main__':
         """)
         partial_content = template.render(
                                        entries=entries,
-                                       target_disruption_match=target_disruption_match,
-                                       target_disruption_index=target_disruption_index,
+                                       target_disruption_match=target_interval_criteria,
+                                       target_disruption_index=target_interval_index,
+                                       total_matching_prowjobs=len(result.keys()),
                                        )
         partials.append(partial_content)
 
@@ -529,9 +592,12 @@ if __name__ == '__main__':
                 }
             </script>
 
-        <h1>Sequence Mining / Frequent Sequence Before First Disruption</h1>
-        <h2>{{ heading }}</h2>
-        <h2>{{ constraints }}</h2>
+        <h1>Sequence Mining / Frequent Sequence Before First Target Interval</h1>
+        <ul>
+            <li><h2>{{ heading }}</h2>
+            <li><h2>{{ matching_jobs }}</h2>
+            <li><h2>{{ constraints }}</h2>
+        </ul>
 
         <br>
         {{ partials_combined | safe }}
@@ -541,7 +607,8 @@ if __name__ == '__main__':
 
     html_content = master_template.render(title='Interval Insights',
                                           heading=f'{start_date} for span {span}',
-                                          constraints=f'Events up to {search_window_intervals["after"]} before disruption and {search_window_intervals["before"]} after disruption',
+                                          matching_jobs='Job matches: ' + ' AND '.join(job_name_matches),
+                                          constraints=f'Events up to {search_window_intervals["after"]} before target interval and {search_window_intervals["before"]} after target interval',
                                           partials_combined='\n'.join(partials),
                                           )
 
@@ -550,5 +617,3 @@ if __name__ == '__main__':
         file.write(html_content)
 
     webbrowser.open(f"file://{os.path.abspath(file_path)}")
-
-    print(handy_query)
