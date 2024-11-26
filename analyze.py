@@ -157,7 +157,7 @@ if __name__ == '__main__':
 
     job_name_matches = (
         "4.18",
-        "vsphere"
+        "azure"
     )
 
     job_name_condition = " AND ".join([f'jobs.prowjob_job_name LIKE "%{entry}%"' for entry in job_name_matches])
@@ -249,6 +249,7 @@ if __name__ == '__main__':
 
         WHERE 
           JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") NOT LIKE "DisruptionEnded"
+          AND NOT ( {target_interval_criteria.render(e_interval_field)} )
           AND
           (
             JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") NOT LIKE "DisruptionBegan"
@@ -258,7 +259,8 @@ if __name__ == '__main__':
             # Service load balancer disruption usually indicate a master node going down.
             # The kube-apiserver is heavily instrumented and is reporting node going down.
             # Just filter these. Same for CSI drivers and openshift-iamge-registry. 
-            d.d_backend_disruption_name = "service-load-balancer-with-pdb-reused-connections" AND 
+            d.d_backend_disruption_name = "service-load-balancer-with-pdb-reused-connections"
+            AND 
             (
                 (
                     JSON_EXTRACT_SCALAR({e_interval_field}, "$.source") = "KubeEvent" AND
