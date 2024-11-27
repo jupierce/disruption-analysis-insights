@@ -3,7 +3,7 @@ import os
 import hashlib
 from enum import Enum
 
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Iterable
 import pathlib
 import json
 
@@ -89,17 +89,29 @@ class AbstractFieldCriterion:
 
 
 class JsonFieldCriterion(AbstractFieldCriterion):
-    def __init__(self, json_path: IntervalPaths, value, operator: str = "="):
+    def __init__(self, json_path: IntervalPaths, value, operator: str = "=", if_null=None):
         self.json_path = json_path
         self.value = value
+        self.if_null = if_null
         if type(self.value) == str:
             self.value = '"' + self.value + '"'
+            if operator == '=':
+                operator = 'LIKE'
+                if if_null is None:
+                    # (NULL LIKE "something%") returns NULL.
+                    # NOT NULL also returns NULL, which evaluates as false.
+                    # JSON_EXTRACT_SCALAR returns NULL if a field is not matched,
+                    # so testing this result with LIKE is dangerous. Instead, test
+                    # against empty string, which should return FALSE instead of NULL.
+                    self.if_null = '""'
         if type(self.value) == bool:
             self.value = 'true' if self.value else 'false'
         self.operator = operator
+        if self.if_null is None:
+            self.if_null = 'NULL'
 
     def render(self, column_name: str):
-        return f'JSON_EXTRACT_SCALAR({column_name}, "{self.json_path.value}") {self.operator} {self.value}'
+        return f'IFNULL(JSON_EXTRACT_SCALAR({column_name}, "{self.json_path.value}"), {self.if_null}) {self.operator} {self.value}'
 
     def __str__(self):
         return f'{self.json_path.name} {self.operator} {self.value}'
@@ -118,18 +130,35 @@ class NamespaceCriterion:
 
 
 class IntervalCriteria:
-    def __init__(self, *fcs: JsonFieldCriterion):
-        self.fcs: List[JsonFieldCriterion] = list(fcs)
+    def __init__(self, target_intervals: Iterable[JsonFieldCriterion], ignore_intervals: Optional[Iterable[JsonFieldCriterion]] = None):
+        self.target_intervals: List[JsonFieldCriterion] = list(target_intervals)
+        self.ignore_intervals = None
+        if ignore_intervals:
+            self.ignore_intervals: List[JsonFieldCriterion] = list(ignore_intervals)
 
-    def render(self, column_name: str):
+    def render_target_condition(self, column_name: str):
         expressions: List[str] = []
-        for fc in self.fcs:
+        for fc in self.target_intervals:
+            expressions.append(fc.render(column_name))
+        return ' AND '.join(expressions)
+
+    def render_ignore_condition(self, column_name: str):
+        if not self.ignore_intervals:
+            return 'FALSE'
+        expressions: List[str] = []
+        for fc in self.ignore_intervals:
             expressions.append(fc.render(column_name))
         return ' AND '.join(expressions)
 
     def __str__(self):
         conds = []
-        for fc in self.fcs:
+        for fc in self.target_intervals:
+            conds.append(str(fc))
+        return '[' + 'AND'.join(conds) + ']'
+
+    def ignore_str(self):
+        conds = []
+        for fc in self.ignore_intervals:
             conds.append(str(fc))
         return '[' + 'AND'.join(conds) + ']'
 
@@ -138,9 +167,9 @@ class DisruptionCriteria(IntervalCriteria):
     def __init__(self, backend_disruption_like: str, *fcs: JsonFieldCriterion):
         super().__init__(*fcs)
         self.backend_disruption_like = backend_disruption_like
-        self.fcs.append(JsonFieldCriterion(IntervalPaths.KEYS_BACKEND_DISRUPTION_NAME, backend_disruption_like, operator='LIKE'))
-        self.fcs.append(JsonFieldCriterion(IntervalPaths.REASON, 'DisruptionBegan'))
-        self.fcs.append(JsonFieldCriterion(IntervalPaths.DISPLAY, True))
+        self.target_intervals.append(JsonFieldCriterion(IntervalPaths.KEYS_BACKEND_DISRUPTION_NAME, backend_disruption_like, operator='LIKE'))
+        self.target_intervals.append(JsonFieldCriterion(IntervalPaths.REASON, 'DisruptionBegan'))
+        self.target_intervals.append(JsonFieldCriterion(IntervalPaths.DISPLAY, True))
 
 
 if __name__ == '__main__':
@@ -148,11 +177,11 @@ if __name__ == '__main__':
     jobs_table_id = 'openshift-gce-devel.ci_analysis_us.jobs'
     intervals_table_id = 'openshift-ci-data-analysis.ci_data_autodl.e2e_intervals'
     start_date = "2024-11-11"
-    span = "INTERVAL 5 DAY"
+    span = "INTERVAL 15 DAY"
 
     search_window_intervals = {
         "before": "INTERVAL 1 SECOND",  # Include events that the disruption was slightly before
-        "after": "INTERVAL 180 SECOND"  # Include events that the disruption was slightly after
+        "after": "INTERVAL 40 SECOND"  # Include events that the disruption was slightly after
     }
 
     job_name_matches = (
@@ -167,8 +196,54 @@ if __name__ == '__main__':
     partials = []  # rendered partial templates for each disruption
     cache_dir = pathlib.Path('cache')
     cache_dir.mkdir(exist_ok=True)
+
+    target_disruptions = [
+        IntervalCriteria(
+            target_intervals=[
+                JsonFieldCriterion(IntervalPaths.KEYS_BACKEND_DISRUPTION_NAME, "service-load-balancer-%")
+            ]
+        ),
+        IntervalCriteria(
+            target_intervals=[
+                JsonFieldCriterion(IntervalPaths.KEYS_BACKEND_DISRUPTION_NAME, "ingress-to-%")
+            ]
+        ),
+        IntervalCriteria(
+            target_intervals=[
+                JsonFieldCriterion(IntervalPaths.KEYS_BACKEND_DISRUPTION_NAME, "cache-kube-api-%")
+            ]
+        ),
+        IntervalCriteria(
+            target_intervals=[
+                JsonFieldCriterion(IntervalPaths.KEYS_BACKEND_DISRUPTION_NAME, "cache-%")
+            ]
+        ),
+        IntervalCriteria(
+            target_intervals=[
+                JsonFieldCriterion(IntervalPaths.KEYS_BACKEND_DISRUPTION_NAME, "kube-api-%")
+            ]
+        ),
+        IntervalCriteria(
+            target_intervals=[
+                JsonFieldCriterion(IntervalPaths.KEYS_BACKEND_DISRUPTION_NAME, "openshift-api-%")
+            ]
+        ),
+        IntervalCriteria(
+            target_intervals=[
+                JsonFieldCriterion(IntervalPaths.KEYS_BACKEND_DISRUPTION_NAME, "oauth-api-%")
+            ]
+        ),
+    ]
+
     for target_interval_index, target_interval_criteria in enumerate([
-        IntervalCriteria(JsonFieldCriterion(IntervalPaths.SOURCE, 'NodeUnexpectedNotReady'))
+        IntervalCriteria(
+            target_intervals=[
+                JsonFieldCriterion(IntervalPaths.SOURCE, 'NodeUnexpectedNotReady')
+            ],
+            ignore_intervals=[
+                JsonFieldCriterion(IntervalPaths.REASON, 'NotReady')
+            ],
+        ), *target_disruptions
     ]):
 
         relevant_events = f"""
@@ -202,7 +277,7 @@ if __name__ == '__main__':
             AND jobs.prowjob_start BETWEEN DATETIME("{start_date}") AND DATETIME_ADD("{start_date}", {span})
             AND jobs.prowjob_job_name NOT LIKE "%single-node%" 
             AND {job_name_condition}
-            AND {target_interval_criteria.render(d_interval_field)}
+            AND {target_interval_criteria.render_target_condition(d_interval_field)}
         ),
         numbered_disruption_events AS (
           SELECT 
@@ -249,7 +324,8 @@ if __name__ == '__main__':
 
         WHERE 
           JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") NOT LIKE "DisruptionEnded"
-          AND NOT ( {target_interval_criteria.render(e_interval_field)} )
+          AND NOT ( {target_interval_criteria.render_target_condition(e_interval_field)} )
+          AND NOT ( {target_interval_criteria.render_ignore_condition(e_interval_field)} )
           AND
           (
             JSON_EXTRACT_SCALAR({e_interval_field}, "$.message.reason") NOT LIKE "DisruptionBegan"
